@@ -13,7 +13,6 @@ import tomllib
 import uuid
 
 API_KEY_SLOTS_VERSION = 1
-API_PROVIDER = 'loopx_openai_api'
 
 
 def api_endpoint(value):
@@ -28,20 +27,6 @@ def api_endpoint(value):
 def auth_kind(raw):
     obj = json.loads(raw)
     return 'api' if obj.get('auth_mode') == 'apikey' else 'subscription'
-
-
-def api_provider(cfg):
-    provider = (cfg.get('model_providers') or {}).get(API_PROVIDER)
-    if provider is None:
-        return None
-    if (set(provider) != {'name', 'base_url', 'wire_api', 'requires_openai_auth', 'supports_websockets', 'request_max_retries', 'stream_max_retries'}
-            or provider['name'] != 'OpenAI API fallback' or provider['wire_api'] != 'responses'
-            or provider['requires_openai_auth'] is not True or provider['supports_websockets'] is not False
-            or type(provider['request_max_retries']) is not int or provider['request_max_retries'] != 0
-            or type(provider['stream_max_retries']) is not int or provider['stream_max_retries'] != 0):
-        raise ValueError('The owned API fallback provider changed; inspect locally')
-    api_endpoint(provider['base_url'])
-    return provider
 
 
 def checked(path):
@@ -148,13 +133,10 @@ def file_config(raw, auth=None):
     except (ValueError, UnicodeError):
         raise ValueError('Invalid GPT config; repair locally without printing its contents') from None
     # Preserve unused custom definitions; they do not change the native route.
-    if (cfg.get('model_provider', 'openai') not in ('openai', API_PROVIDER)
+    if (cfg.get('model_provider', 'openai') != 'openai'
             or 'openai' in (cfg.get('model_providers') or {})
             or cfg.get('model_catalog_json') or cfg.get('profiles') or cfg.get('profile')):
         raise ValueError('Account switching requires an ordinary native GPT config')
-    owned_api = api_provider(cfg)
-    if cfg.get('model_provider') == API_PROVIDER and (not owned_api or cfg.get('forced_login_method') != 'api'):
-        raise ValueError('Invalid owned API fallback route')
     if cfg.get('cli_auth_credentials_store') not in (None, 'auto', 'file'):
         raise ValueError('Explicit keyring/ephemeral storage is preserved; use native sign-in or review file storage locally')
     if cfg.get('forced_login_method') not in (None, 'chatgpt', 'api'):
@@ -168,8 +150,18 @@ def file_config(raw, auth=None):
     section = re.search(r'^\s*\[', text, re.M)
     head, tail = (text[:section.start()], text[section.start():]) if section else (text, '')
     settings = [('cli_auth_credentials_store', 'file'), ('forced_login_method', mode)]
-    if mode == 'api' or cfg.get('model_provider') == API_PROVIDER:
-        settings.append(('model_provider', API_PROVIDER if mode == 'api' else 'openai'))
+    if mode == 'api':
+        if cfg.get('openai_base_url') and cfg.get('forced_login_method') != 'api':
+            raise ValueError('An existing OpenAI base URL must not be replaced by API fallback')
+        if cfg.get('openai_base_url'):
+            api_endpoint(cfg['openai_base_url'])
+        settings.append(('openai_base_url', endpoint))
+    elif cfg.get('forced_login_method') == 'api' and cfg.get('openai_base_url'):
+        api_endpoint(cfg['openai_base_url'])
+        pattern = r'^openai_base_url\s*=.*(?:\n|$)'
+        if len(re.findall(pattern, head, re.M)) != 1:
+            raise ValueError('Nonstandard API base URL syntax requires local review')
+        head = re.sub(pattern, '', head, flags=re.M)
     for key, value in settings:
         pattern = rf'^{key}\s*=.*$'
         if key in cfg:
@@ -178,11 +170,6 @@ def file_config(raw, auth=None):
             head = re.sub(pattern, f'{key} = "{value}"', head, flags=re.M)
         else:
             head = f'{key} = "{value}"\n' + head
-    if endpoint:
-        tail = re.sub(r'(?ms)^\[model_providers\.loopx_openai_api\]\s*\n.*?(?=^\[|\Z)', '', tail)
-        tail += ('\n[model_providers.loopx_openai_api]\nname="OpenAI API fallback"\n'
-                 f'base_url={json.dumps(endpoint)}\nwire_api="responses"\nrequires_openai_auth=true\n'
-                 'supports_websockets=false\nrequest_max_retries=0\nstream_max_retries=0\n')
     return (head + tail).encode()
 
 
