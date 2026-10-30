@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import Mock, patch
 
@@ -59,6 +60,51 @@ class AccountTests(unittest.TestCase):
     def ready(self):
         self.current()
         self.enroll_b()
+
+    def test_api_enrollment_never_selects_or_restarts_a_subscription(self):
+        self.current()
+        before = {p: p.read_bytes() for p in (self.manager.auth, self.manager.config, self.manager.active)}
+        self.idle.reset_mock()
+        result = self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url='http://127.0.0.1:32100/v1')
+        self.assertFalse(result['activated'])
+        self.idle.assert_not_called()
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+        self.assertEqual(self.manager.status()['slot_kinds'], {'a': 'subscription', 'api': 'api'})
+        self.assertNotIn('synthetic-local-relay-token', json.dumps(self.manager.status()))
+
+    def test_api_switch_and_subscription_return_reuse_transaction_recovery(self):
+        self.current()
+        original = self.manager.config.read_bytes()
+        self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url='http://127.0.0.1:32100/v1')
+        self.manager.switch('api')
+        cfg = tomllib.loads(self.manager.config.read_text())
+        self.assertEqual(cfg['model_provider'], accounts.API_PROVIDER)
+        self.assertEqual(cfg['forced_login_method'], 'api')
+        self.assertTrue(cfg['model_providers'][accounts.API_PROVIDER]['requires_openai_auth'])
+        self.assertEqual(self.manager.selected()[0]['slot'], 'api')
+        self.manager.recover(rollback=True)
+        self.assertEqual(self.manager.auth.read_bytes(), self.a)
+        self.assertEqual(self.manager.config.read_bytes(), original)
+        self.manager.switch('api')
+        self.manager.switch('a')
+        cfg = tomllib.loads(self.manager.config.read_text())
+        self.assertEqual(cfg['model_provider'], 'openai')
+        self.assertEqual(cfg['forced_login_method'], 'chatgpt')
+        self.assertEqual(self.manager.auth.read_bytes(), self.a)
+
+    def test_api_fallback_refuses_non_loopback_and_changed_owned_provider(self):
+        self.current()
+        for endpoint in ['https://outside.example/v1', 'http://localhost:32100/v1',
+                         'http://127.0.0.1:80/v1', 'http://127.0.0.1:32100/v1?forward=other']:
+            with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url=endpoint)
+        self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url='http://127.0.0.1:32100/v1')
+        self.manager.switch('api')
+        changed = self.manager.config.read_text().replace('requires_openai_auth=true', 'requires_openai_auth=false')
+        self.manager.config.write_text(changed)
+        with self.assertRaises(ValueError):
+            self.manager.switch('a')
+        self.assertEqual(self.manager.config.read_text(), changed)
 
     def test_readonly_status_creates_nothing_and_prints_no_identity(self):
         result = self.manager.status()

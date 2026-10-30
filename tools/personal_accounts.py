@@ -12,6 +12,37 @@ import tempfile
 import tomllib
 import uuid
 
+API_KEY_SLOTS_VERSION = 1
+API_PROVIDER = 'loopx_openai_api'
+
+
+def api_endpoint(value):
+    if not isinstance(value, str) or not re.fullmatch(r'http://127\.0\.0\.1:[0-9]+/v1', value):
+        raise ValueError('API fallback requires an explicit loopback Responses endpoint')
+    port = int(value.split(':')[2].split('/')[0])
+    if not 1024 <= port <= 65535:
+        raise ValueError('API fallback requires an unprivileged loopback port')
+    return value
+
+
+def auth_kind(raw):
+    obj = json.loads(raw)
+    return 'api' if obj.get('auth_mode') == 'apikey' else 'subscription'
+
+
+def api_provider(cfg):
+    provider = (cfg.get('model_providers') or {}).get(API_PROVIDER)
+    if provider is None:
+        return None
+    if (set(provider) != {'name', 'base_url', 'wire_api', 'requires_openai_auth', 'supports_websockets', 'request_max_retries', 'stream_max_retries'}
+            or provider['name'] != 'OpenAI API fallback' or provider['wire_api'] != 'responses'
+            or provider['requires_openai_auth'] is not True or provider['supports_websockets'] is not False
+            or type(provider['request_max_retries']) is not int or provider['request_max_retries'] != 0
+            or type(provider['stream_max_retries']) is not int or provider['stream_max_retries'] != 0):
+        raise ValueError('The owned API fallback provider changed; inspect locally')
+    api_endpoint(provider['base_url'])
+    return provider
+
 
 def checked(path):
     path = Path(path)
@@ -83,6 +114,12 @@ def identity(raw):
     """Metadata comparison only; official Codex owns verification and refresh."""
     try:
         obj = json.loads(raw)
+        if obj.get('auth_mode') == 'apikey':
+            key = obj.get('OPENAI_API_KEY')
+            if not isinstance(key, str) or not 20 <= len(key) <= 512 or any(c.isspace() for c in key) or obj.get('tokens'):
+                raise ValueError()
+            endpoint = api_endpoint(obj.get('loopx_api_base_url'))
+            return digest(encoded(['apikey', key, endpoint]))
         tokens = obj['tokens']
         if obj.get('auth_mode') not in (None, 'chatgpt') or obj.get('OPENAI_API_KEY'):
             raise ValueError()
@@ -101,28 +138,39 @@ def identity(raw):
             raise ValueError()
         return digest(encoded([subject, account]))
     except (ValueError, KeyError, TypeError, AttributeError, UnicodeError):
-        raise ValueError('Invalid ChatGPT login cache; complete official login locally') from None
+        raise ValueError('Invalid native account cache; inspect the local login or relay configuration') from None
 
 
-def file_config(raw):
+def file_config(raw, auth=None):
     try:
         text = raw.decode()
         cfg = tomllib.loads(text)
     except (ValueError, UnicodeError):
         raise ValueError('Invalid GPT config; repair locally without printing its contents') from None
     # Preserve unused custom definitions; they do not change the native route.
-    if (cfg.get('model_provider', 'openai') != 'openai'
+    if (cfg.get('model_provider', 'openai') not in ('openai', API_PROVIDER)
             or 'openai' in (cfg.get('model_providers') or {})
             or cfg.get('model_catalog_json') or cfg.get('profiles') or cfg.get('profile')):
         raise ValueError('Account switching requires an ordinary native GPT config')
+    owned_api = api_provider(cfg)
+    if cfg.get('model_provider') == API_PROVIDER and (not owned_api or cfg.get('forced_login_method') != 'api'):
+        raise ValueError('Invalid owned API fallback route')
     if cfg.get('cli_auth_credentials_store') not in (None, 'auto', 'file'):
         raise ValueError('Explicit keyring/ephemeral storage is preserved; use native sign-in or review file storage locally')
-    if cfg.get('forced_login_method') not in (None, 'chatgpt'):
-        raise ValueError('Account slots support ChatGPT login only')
+    if cfg.get('forced_login_method') not in (None, 'chatgpt', 'api'):
+        raise ValueError('Unsupported account login method')
+    mode = 'api' if auth is not None and auth_kind(auth) == 'api' else 'chatgpt'
+    endpoint = None
+    if mode == 'api':
+        identity(auth)
+        endpoint = api_endpoint(json.loads(auth)['loopx_api_base_url'])
     # Change only two top-level auth settings; retain model and all unrelated config.
     section = re.search(r'^\s*\[', text, re.M)
     head, tail = (text[:section.start()], text[section.start():]) if section else (text, '')
-    for key, value in [('cli_auth_credentials_store', 'file'), ('forced_login_method', 'chatgpt')]:
+    settings = [('cli_auth_credentials_store', 'file'), ('forced_login_method', mode)]
+    if mode == 'api' or cfg.get('model_provider') == API_PROVIDER:
+        settings.append(('model_provider', API_PROVIDER if mode == 'api' else 'openai'))
+    for key, value in settings:
         pattern = rf'^{key}\s*=.*$'
         if key in cfg:
             if len(re.findall(pattern, head, re.M)) != 1:
@@ -130,6 +178,11 @@ def file_config(raw):
             head = re.sub(pattern, f'{key} = "{value}"', head, flags=re.M)
         else:
             head = f'{key} = "{value}"\n' + head
+    if endpoint:
+        tail = re.sub(r'(?ms)^\[model_providers\.loopx_openai_api\]\s*\n.*?(?=^\[|\Z)', '', tail)
+        tail += ('\n[model_providers.loopx_openai_api]\nname="OpenAI API fallback"\n'
+                 f'base_url={json.dumps(endpoint)}\nwire_api="responses"\nrequires_openai_auth=true\n'
+                 'supports_websockets=false\nrequest_max_retries=0\nstream_max_retries=0\n')
     return (head + tail).encode()
 
 
@@ -274,19 +327,41 @@ class Accounts:
 
     def status(self):
         names = []
+        kinds = {}
         folder = checked(self.root / 'slots')
         if folder.exists():
             for child in sorted(folder.iterdir()):
                 identity(read_private(self.slot(child.name)))
                 names.append(child.name)
+                kinds[child.name] = auth_kind(read_private(self.slot(child.name)))
         state = self.state()
         matches = None
         if state and self.auth.exists():
             matches = identity(read_private(self.auth)) == state['identity']
-        return {'slots': names, 'active_slot': state['slot'] if state else None,
+        return {'slots': names, 'slot_kinds': kinds, 'active_slot': state['slot'] if state else None,
                 'current_login_matches': matches, 'recovery_required': self.pending.exists(),
                 'home': str(self.spec['home']), 'frontend': str(self.spec['frontend']),
                 'live_authentication_verified': False}
+
+    def enroll_api(self, name, *, api_key, base_url):
+        """Enroll an explicit local relay credential without selecting it."""
+        raw = encoded({'auth_mode': 'apikey', 'OPENAI_API_KEY': api_key,
+                       'loopx_api_base_url': api_endpoint(base_url)})
+        ident = identity(raw)
+        target = self.slot(name)
+        with self.lock(enrollment=True):
+            if self.pending.exists():
+                raise ValueError('Recover an interrupted operation before enrollment')
+            if target.exists():
+                if read_private(target) == raw:
+                    return {'slot': name, 'activated': False, 'credentials_printed': False}
+                raise ValueError('Existing slots are never overwritten')
+            if any(identity(read_private(self.slot(other))) == ident for other in self.status()['slots']):
+                raise ValueError('That credential is already registered')
+            if not self.binding_file.exists():
+                atomic(self.binding_file, encoded(self.binding))
+            atomic(target, raw)
+            return {'slot': name, 'activated': False, 'credentials_printed': False}
 
     def enroll(self, name, current=False):
         target = self.slot(name)
@@ -337,7 +412,7 @@ class Accounts:
             raise ValueError('Interrupted account operation; run codex app recover with GPT closed')
         raw = read_private(target)
         ident = identity(raw)
-        converted = file_config(self.config.read_bytes())
+        converted = file_config(self.config.read_bytes(), raw)
         state, outgoing = self.selected()
         if dry_run:
             return {'preview': True, 'slot': name, 'home': str(self.spec['home']),
@@ -348,7 +423,7 @@ class Accounts:
             state, outgoing = self.selected()
             raw = outgoing if state and state['slot'] == name else read_private(target)
             ident = identity(raw)
-            converted = file_config(self.config.read_bytes())
+            converted = file_config(self.config.read_bytes(), raw)
             updates = [('slot:' + state['slot'], outgoing)] if state else []
             updates += [('config', converted), ('auth', raw),
                         ('active', encoded({'slot': name, 'identity': ident, 'binding': self.binding}))]

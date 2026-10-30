@@ -163,9 +163,13 @@ def check_provider(spec, role):
     if role == 'gpt':
         # Extra definitions do not select a provider. Keep the native default
         # and catalog, and reject a definition that shadows the native ID.
-        if (cfg.get('model_provider', 'openai') != 'openai' or cfg.get('model_catalog_json')
+        from personal_accounts import API_PROVIDER, api_provider
+        provider = cfg.get('model_provider', 'openai')
+        if (provider not in ('openai', API_PROVIDER) or cfg.get('model_catalog_json')
                 or 'openai' in (cfg.get('model_providers') or {})):
             raise ValueError('GPT route requires the native OpenAI provider and catalog')
+        if provider == API_PROVIDER and (not api_provider(cfg) or cfg.get('forced_login_method') != 'api'):
+            raise ValueError('GPT API fallback requires its owned loopback provider')
     else:
         from urllib.parse import urlsplit
         p = (cfg.get('model_providers') or {}).get('deepseek', {})
