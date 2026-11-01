@@ -65,17 +65,24 @@ class AccountTests(unittest.TestCase):
         self.current()
         before = {p: p.read_bytes() for p in (self.manager.auth, self.manager.config, self.manager.active)}
         self.idle.reset_mock()
-        result = self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url='http://127.0.0.1:32100/v1')
+        result = self.manager.enroll_api('api', api_key='sk-loopx-relay-synthetic-local-token', base_url='http://127.0.0.1:32100/v1')
         self.assertFalse(result['activated'])
         self.idle.assert_not_called()
         self.assertEqual({p: p.read_bytes() for p in before}, before)
         self.assertEqual(self.manager.status()['slot_kinds'], {'a': 'subscription', 'api': 'api'})
-        self.assertNotIn('synthetic-local-relay-token', json.dumps(self.manager.status()))
+        self.assertNotIn('sk-loopx-relay-synthetic-local-token', json.dumps(self.manager.status()))
+
+    def test_api_slot_rejects_an_upstream_project_key(self):
+        self.current()
+        with self.assertRaises(ValueError):
+            self.manager.enroll_api('api', api_key='sk-proj-' + 'synthetic-project-key' * 2,
+                                    base_url='http://127.0.0.1:32100/v1')
+        self.assertFalse(self.manager.slot('api').exists())
 
     def test_api_switch_and_subscription_return_reuse_transaction_recovery(self):
         self.current()
         original = self.manager.config.read_bytes()
-        self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url='http://127.0.0.1:32100/v1')
+        self.manager.enroll_api('api', api_key='sk-loopx-relay-synthetic-local-token', base_url='http://127.0.0.1:32100/v1')
         self.manager.switch('api')
         cfg = tomllib.loads(self.manager.config.read_text())
         self.assertEqual(cfg.get('model_provider', 'openai'), 'openai')
@@ -97,8 +104,8 @@ class AccountTests(unittest.TestCase):
         for endpoint in ['https://outside.example/v1', 'http://localhost:32100/v1',
                          'http://127.0.0.1:80/v1', 'http://127.0.0.1:32100/v1?forward=other']:
             with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
-                self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url=endpoint)
-        self.manager.enroll_api('api', api_key='synthetic-local-relay-token', base_url='http://127.0.0.1:32100/v1')
+                self.manager.enroll_api('api', api_key='sk-loopx-relay-synthetic-local-token', base_url=endpoint)
+        self.manager.enroll_api('api', api_key='sk-loopx-relay-synthetic-local-token', base_url='http://127.0.0.1:32100/v1')
         self.manager.switch('api')
         changed = self.manager.config.read_text().replace('http://127.0.0.1:32100/v1', 'https://outside.example/v1')
         self.manager.config.write_text(changed)

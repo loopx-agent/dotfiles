@@ -101,7 +101,8 @@ def identity(raw):
         obj = json.loads(raw)
         if obj.get('auth_mode') == 'apikey':
             key = obj.get('OPENAI_API_KEY')
-            if not isinstance(key, str) or not 20 <= len(key) <= 512 or any(c.isspace() for c in key) or obj.get('tokens'):
+            if (not isinstance(key, str) or not key.startswith('sk-loopx-relay-')
+                    or not 32 <= len(key) <= 512 or any(c.isspace() for c in key) or obj.get('tokens')):
                 raise ValueError()
             endpoint = api_endpoint(obj.get('loopx_api_base_url'))
             return digest(encoded(['apikey', key, endpoint]))
